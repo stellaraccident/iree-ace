@@ -1,6 +1,6 @@
 """Primary interactive API for manipulating artifacts."""
 
-from typing import Any, Dict, Union
+from typing import Any, Dict, List, Sequence, Union
 from pathlib import Path
 import re
 import time
@@ -15,13 +15,17 @@ from iree.compiler.api import (
 from iree.compiler.ir import (
     Block,
     Context,
+    FunctionType,
     Location,
     Module,
     Operation,
     StringAttr,
     SymbolTable,
+    Type,
+    TypeAttr,
 )
 
+from . import builder
 from . import merge_utils
 
 __all__ = [
@@ -90,8 +94,24 @@ class WorkspaceModule:
         self.module = module
 
     @property
+    def builder(self) -> builder.Builder:
+        return builder.Builder(self.module)
+
+    @property
     def body(self) -> Block:
         return self.module.regions[0].blocks[0]
+
+    @property
+    def functions(self) -> Dict[str, "FunctionInfo"]:
+        results = {}
+        for op_view in self.body:
+            op = op_view.operation
+            op_name = op.name
+            if op_name not in ["func.func"]:
+                continue
+            func_name = StringAttr(SymbolTable.get_symbol_name(op)).value
+            results[func_name] = FunctionInfo(op)
+        return results
 
     @property
     def public_functions(self) -> Dict[str, "FunctionInfo"]:
@@ -129,7 +149,7 @@ class InputModule(WorkspaceModule):
         self, workspace: Workspace, ident: str, inv: Invocation, module: Operation
     ):
         super().__init__(workspace, ident, inv, module)
-        self.transforms = InputModuleTransforms(self)
+        self.transforms = ModuleTransforms(self)
 
     def __repr__(self):
         return f"InputModule({self.ident})"
@@ -142,14 +162,15 @@ class OutputModule(WorkspaceModule):
         self, workspace: Workspace, ident: str, inv: Invocation, module: Operation
     ):
         super().__init__(workspace, ident, inv, module)
+        self.transforms = ModuleTransforms(self)
 
     def __repr__(self):
         return f"OutputModule({self.ident})"
 
 
-class InputModuleTransforms:
-    def __init__(self, input: InputModule):
-        self.input = input
+class ModuleTransforms:
+    def __init__(self, wm: WorkspaceModule):
+        self.wm = wm
 
     def normalize_constants(self):
         """Normalizes any eligible constants in the program to globals.
@@ -160,9 +181,15 @@ class InputModuleTransforms:
         constants.
         """
         # We first make sure to legalize any foreign dialect globals.
-        self.input.inv.execute_text_pass_pipeline(
+        self.wm.inv.execute_text_pass_pipeline(
             "iree-import-public, iree-import-ml-program, iree-util-outline-constants, symbol-dce"
         )
+
+    def inline(self):
+        self.wm.inv.execute_text_pass_pipeline("inline")
+
+    def cse(self):
+        self.wm.inv.execute_text_pass_pipeline("cse, canonicalize")
 
 
 class FunctionInfo:
@@ -170,6 +197,25 @@ class FunctionInfo:
 
     def __init__(self, op: Operation):
         self.op = op
+
+    @property
+    def function_type(self) -> FunctionType:
+        return FunctionType(TypeAttr(self.op.attributes["function_type"]).value)
+
+    @property
+    def input_types(self) -> Sequence[Type]:
+        return self.function_type.inputs
+
+    @property
+    def result_types(self) -> Sequence[Type]:
+        return self.function_type.results
+
+    def set_private(self):
+        self.op.attributes["sym_visibility"] = StringAttr.get(
+            "private", context=self.op.context
+        )
+        # TODO: Not sure why this complains that it should have a visibility.
+        # SymbolTable.set_visibility(self.op, "private")
 
     def __repr__(self):
         return f"Function(@{SymbolTable.get_symbol_name(self.op)})"
